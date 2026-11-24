@@ -1,6 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import { BASE_FEE, Contract, Networks, TransactionBuilder, rpc, scValToNative, nativeToScVal, xdr } from '@stellar/stellar-sdk';
+import { existsSync } from 'node:fs';
+import { createIndexer } from './indexer.js';
+
+if (existsSync('.env')) process.loadEnvFile('.env');
 
 const contractId = process.env.SPLITTER_CONTRACT_ID ?? '';
 const readAccount = process.env.READ_ACCOUNT ?? '';
@@ -10,6 +14,7 @@ if (!contractId || !readAccount || !Number.isSafeInteger(startLedger) || startLe
 }
 const passphrase = process.env.STELLAR_NETWORK_PASSPHRASE ?? Networks.TESTNET;
 const server = new rpc.Server(process.env.STELLAR_RPC_URL ?? 'https://soroban-testnet.stellar.org');
+const indexer = createIndexer(server, contractId, startLedger, process.env.EVENT_STORE_PATH ?? 'data/events.json');
 const app = express();
 app.disable('x-powered-by');
 app.use(cors({ origin: process.env.PUBLIC_ORIGIN ?? 'http://localhost:5173' }));
@@ -56,21 +61,9 @@ app.get('/teams/:id', async (req, res) => {
 app.get('/teams/:id/donations', async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isSafeInteger(id) || id < 1) return void res.status(400).json({ error: 'Invalid team ID' });
-  try {
-    // RPC retains a limited event window. A persistent indexer is needed for a permanent archive.
-    const page = await server.getEvents({
-      startLedger,
-      filters: [{ type: 'contract', contractIds: [contractId] }],
-      limit: 200,
-    });
-    const donations = page.events.flatMap(event => {
-      const topics = event.topic.map(value => jsonSafe(scValToNative(value)));
-      if (topics[0] !== 'donation' || Number(topics[1]) !== id) return [];
-      const payload = jsonSafe(scValToNative(event.value)) as Record<string, unknown>;
-      return [{ id: event.id, ledger: event.ledger, transactionHash: event.txHash, donor: topics[2], ...payload }];
-    });
-    res.json({ donations, hasMore: Boolean(page.cursor), note: 'Recent RPC events only; this is not a permanent archive.' });
-  } catch (error) { fail(res, error); }
+  const before = typeof req.query.before === 'string' ? req.query.before : undefined;
+  const limit = Math.max(1, Math.min(Number(req.query.limit) || 20, 100));
+  res.json(indexer.donations(id, before, limit));
 });
 
 function rpcId(id: number) {
